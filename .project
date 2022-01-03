@@ -3,6 +3,7 @@
 	<name>ipv8test</name>
 	<comment></comment>
 	<projects>
+		<project>asyncaead</project>
 		<project>tribler</project>
 	</projects>
 	<buildSpec>

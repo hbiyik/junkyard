@@ -10,11 +10,11 @@ import pprofile
 import struct
 import copy
 
-from ipv8.messaging.anonymization.tunnel import EXIT_NODE, ORIGINATOR, IntroductionPoint
+from ipv8.messaging.anonymization.tunnel import EXIT_NODE, ORIGINATOR
 from ipv8.messaging.anonymization.tunnelcrypto import TunnelCrypto
 from ipv8.messaging.anonymization.utils import run_speed_test
 from ipv8.messaging.anonymization.hidden_services import HiddenTunnelCommunity
-from ipv8.messaging.anonymization.community import TunnelSettings, PEER_FLAG_EXIT_BT, PEER_FLAG_EXIT_IPV8
+from ipv8.messaging.anonymization.community import TunnelCommunity, TunnelSettings, PEER_FLAG_EXIT_BT, PEER_FLAG_EXIT_IPV8, PEER_FLAG_RELAY
 from ipv8.configuration import ConfigBuilder, Strategy, WalkerDefinition, Bootstrapper, BootstrapperDefinition
 from ipv8_service import IPv8
 from ipv8.taskmanager import task
@@ -24,17 +24,18 @@ SWARMINFOHASH = binascii.unhexlify('e24d8e65a329a59b41a532ebd4eb4a3db7cb291b')
 
 # results are printed to console and saved as texfiles in the CWD
 
-TOTALMB = 25 # total MB to ping pong in between entry and exit
+TOTALMB = 100 # total MB to ping pong in between entry and exit
 STARTPORT = 7090 # each peer is incrementing this ipv8 port
 PROFILE = False # if enabled, enables linerprofiler on entry node, results save in profile.txt
 UVLOOP = False # change the reactor to UVLOOP instead of asyncio
-AEADPY = False # use faster symmetric encrytion library, the idea is implemented here, little bit ugly: https://github.com/shaktee/aeadpy
+EVP = False # use faster symmetric encrytion library, the idea is implemented here, little bit ugly: https://github.com/shaktee/aeadpy
 USEAFFINITY = True # each peer is running as a seperate proceess, when affinities enabled, each peer strictly runs on specified core in CPU_AFFINITIES. This is very usefull to compare performance of different pyipv8 implementations
-HOPS = [1] # test for each node count 
+HOPS = [3] # test for each node count 
 E2E = [True] # test for each e2e criteria
 SCALE = 1 # scale the transmitted packet size on test, bigger the faster, because it reduces the reactor overhead, however be carefull not to exceed UDP packet size
 LOGLEVEL = 20
 TRACKERPORT = 7089
+ADDRESS = "127.0.0.1"
 
 TOTALMB = TOTALMB * SCALE
 CPU_AFFINITIES = {"exit":[3],
@@ -42,16 +43,42 @@ CPU_AFFINITIES = {"exit":[3],
                   "entry": [0],
                   "middle": [1, 4, 5, 6, 7]}
 CORES = multiprocessing.cpu_count()
-bootstrap_defs = [BootstrapperDefinition(Bootstrapper.DispersyBootstrapper, {'ip_addresses': [("192.168.2.226", TRACKERPORT)],
-                                                                             'dns_addresses': [],
-                                                                             'bootstrap_timeout': 0.0})]
-
 processes = []
 profiler = pprofile.Profile()
 
-if AEADPY:
-    import aeadpy
+
+bootstrap_defs = [BootstrapperDefinition(Bootstrapper.DispersyBootstrapper, {'ip_addresses': [(ADDRESS, TRACKERPORT)],
+                                                                             'dns_addresses': [],
+                                                                             'bootstrap_timeout': 0.0})]
+
+
+if EVP:
+    import evp
+    Evp = evp.Aead()
     
+    class CryptoBackend(TunnelCrypto):
+        def initialize(self, key):
+            TunnelCrypto.initialize(self, key)
+            self.logger = logging.getLogger(self.__class__.__name__)
+            print("Using EVP")
+            
+        def encrypt_str(self, content, key, salt, salt_explicit):
+            # return the encrypted content prepended with salt_explicit
+            salt_explicit = struct.pack('!q', salt_explicit)
+            ciphertext = Evp.encrypt(content, key, salt + salt_explicit, b"")
+            return salt_explicit + ciphertext
+    
+        def decrypt_str(self, content, key, salt):
+            # content contains the tag and salt_explicit in plaintext
+            if len(content) < 24:
+                raise Exception("truncated content")
+    
+            block = salt + content
+            return Evp.decrypt(block[12:], key, block[:12], b"")
+        
+else:
+    CryptoBackend = TunnelCrypto
+
 
 def getcpucore(role, affinities):
     if not USEAFFINITY:
@@ -65,54 +92,36 @@ def getcpucore(role, affinities):
     return core
 
 
-class AeadCrypto(TunnelCrypto):
-    def initialize(self, key):
-        TunnelCrypto.initialize(self, key)
-        self.logger = logging.getLogger(self.__class__.__name__)
-        print("Using AEADpy")
-        
-    def encrypt_str(self, content, key, salt, salt_explicit):
-        saltex = struct.pack('!q', salt_explicit)
-        ciphertext = aeadpy.encrypt(b"CHACHA20_POLY1305", key, content, salt + saltex, b"")
-        return saltex + ciphertext["ciphertext"] + ciphertext["tag"]
-
-    def decrypt_str(self, content, key, salt):
-        content = salt + content
-        return aeadpy.decrypt(b"CHACHA20_POLY1305", key, content[12:], content[:12], b"", b"")["plaintext"]
-
-
-
 class FakeDhtProvider:
-    def __init__(self, pipe):
-        self.peers = []
-        self.pipe = pipe
-        self._pk = None
+    def __init__(self):
+        self.pipel, self.piper = multiprocessing.Pipe()
+        self.ip = None
         
-    @property
-    def pk(self):
-        if not self._pk:
-            self._pk = self.pipe.recv()
-        return self._pk
-    
     def add(self, peer):
-        self.peers.append(peer)
+        pass
     
     async def peer_lookup(self, mid, peer=None):
         logging.info("peer lookup")
     
     async def announce(self, info_hash, intro_point):
         logging.info("peer announce")
+        ip = copy.deepcopy(intro_point)
+        ip.source = 1
+        self.pipel.send(ip)
 
     async def lookup(self, infohash):
         logging.info("lookup")
-        return infohash, [IntroductionPoint(x, self.pk, source=1) for x in self.peers]
+        if not self.ip and self.piper.poll(1):
+            self.ip = self.piper.recv()
+        if self.ip:
+            return self.ip.seeder_pk, [self.ip]
 
-seed_lpipe, seed_rpipe = multiprocessing.Pipe()
 entry_lpipe, entry_rpipe = multiprocessing.Pipe()
-fakeprovider = FakeDhtProvider(seed_lpipe)
+fakeprovider = FakeDhtProvider()
 
+TCommunity = HiddenTunnelCommunity if E2E else TunnelCommunity 
 
-class SpeedTest(HiddenTunnelCommunity):
+class SpeedTest(TCommunity):
     community_id = os.urandom(20)
 
     def __init__(self, *args, **kwargs):
@@ -129,16 +138,15 @@ class SpeedTest(HiddenTunnelCommunity):
             self.dht_provider = fakeprovider
 
     def started(self):
+        logging.info("i am: %s" % self.my_peer)
         if self.ise2e:
-            fakeprovider.add(self.my_peer)
+            self.register_task("doping", self.do_ping)
+            self.register_task("docirc", self.do_circuits)
             if self.isentry:
                 self.join_swarm(SWARMINFOHASH, self.targethops, seeding=False, callback=self.on_community_started)
             elif self.isseed:
                 self.join_swarm(SWARMINFOHASH, self.targethops, seeding=True)
-                self.pipe.send(self.swarms[SWARMINFOHASH].seeder_sk.pub().key_to_bin())
-                self.register_task("introduction_point", self.create_introduction_point, SWARMINFOHASH, delay=10)
-            self.register_task("doping", self.do_ping)
-            self.register_task("docirc", self.do_circuits, delay=1)
+                self.register_task("introduction_point", self.create_introduction_point, SWARMINFOHASH, delay=3)
         else:
             self.register_task("started", self.on_community_started)
     
@@ -189,6 +197,7 @@ async def start_community(i, hops, isexit=False, isentry=False, ise2e=False, iss
     builder = ConfigBuilder().clear_keys().clear_overlays()
     port = STARTPORT + i
     builder.set_port(port)
+    builder.set_address(ADDRESS)
     role = "entry " if isentry else "exit  " if isexit else "seed  " if isseed else "middle"
     builder.config['logger'] = {"format": f"{port}->{role}: %(asctime)s - %(name)s - %(levelname)s - %(message)s", "level": LOGLEVEL}
     builder.add_key("my peer", "curve25519", f"ec{i}.pem")
@@ -197,8 +206,9 @@ async def start_community(i, hops, isexit=False, isentry=False, ise2e=False, iss
     if isexit:
         settings.peer_flags.add(PEER_FLAG_EXIT_IPV8)
         settings.peer_flags.add(PEER_FLAG_EXIT_BT)
-    if AEADPY:
-        settings.crypto = AeadCrypto()
+    elif isseed or isentry:
+        settings.peer_flags.remove(PEER_FLAG_RELAY)
+    settings.crypto = CryptoBackend()
     extra_communities = {}
     builder.add_overlay("SpeedTest",
                         "my peer",
@@ -206,7 +216,7 @@ async def start_community(i, hops, isexit=False, isentry=False, ise2e=False, iss
                         # [BootstrapperDefinition(Bootstrapper.UDPBroadcastBootstrapper, {})],
                         bootstrap_defs,
                         {"settings": settings,
-                         "pipe": seed_rpipe if isseed else entry_rpipe if isentry else None,
+                         "pipe": entry_rpipe if isentry else None,
                          "isentry": isentry,
                          "isexit": isexit,
                          "ise2e": ise2e,
@@ -256,26 +266,27 @@ def runtracker(port):
 
 
 
+
 def runtest(hops, ise2e):
     print("Starting test for HOPS: %s, E2E: %s" % (hops, ise2e))
     affinities = copy.deepcopy(CPU_AFFINITIES)
     
     runtracker(TRACKERPORT)
 
-    # start hops
-    for i in range(hops):
-        runprocess(i, hops, False, i == 0, ise2e, False, affinities)
-        
-    # start exit
-    runprocess(i + 1, hops, True, False, ise2e, False, affinities)
+    # start exit & rand in the same instance
+    runprocess(0, hops, True, False, ise2e, False, affinities)
     
+    # start hops
+    for i in range(hops + 3 if E2E else hops):
+        runprocess(i + 1, hops, False, i == 0, ise2e, False, affinities)
+        
     # 1 more peer when E2E
     if ise2e:
         runprocess(i + 2, hops, False, False, ise2e, True, affinities)
     
     # wait for finish signal, and kill everything like a faschist
     if entry_lpipe.recv():
-        time.sleep(1)
+        time.sleep(2)
         for p in processes:
             pass
             p.kill()

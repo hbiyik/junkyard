@@ -12,14 +12,10 @@ import os
 import time
 import traceback
 import pprofile
-import cffi
-import aeadpy
+import evp
 
 
 from libnacl.aead import AEAD
-from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305, AESGCM
-from cryptography.hazmat.backends.openssl.backend import backend
-from cryptography.hazmat.backends.openssl import aead as opensslaead
 from multiprocessing import Process, Pipe, cpu_count
 
 k1 = 2 ** 17
@@ -29,11 +25,14 @@ profiler = pprofile.Profile()
 _ENCRYPT = 1
 _DECRYPT = 0
 
-def worker(i, conn, callback):
+Evp = evp.Aead()
+
+
+def worker(i, conn, callback, tout):
     count = acttime = 0
     startt = time.time()
     args = conn.recv()
-    while acttime < 3:
+    while acttime < tout:
         callback(*args)
         count += 1
         acttime = time.time() - startt
@@ -42,7 +41,6 @@ def worker(i, conn, callback):
 
 class manager:
     def __init__(self, callback, timeout):
-        self.timeout = timeout
         self.pipes = []
         self.wcount = cpu_count()
         self.cb = callback
@@ -50,7 +48,7 @@ class manager:
         for i in range(self.wcount):
             parent_conn, child_conn = Pipe()
             self.pipes.append(parent_conn)
-            p = Process(target=worker, args=[i, child_conn, callback], name=str(i))
+            p = Process(target=worker, args=[i, child_conn, callback, timeout], name=str(i))
             self.p.append(p)
             p.start()
 
@@ -71,10 +69,10 @@ class manager:
             
 
 
-def _bench(callback, content, key, nonce):
+def _bench(callback, content, key, nonce, tout):
     acttime = count = 0
     startt = time.time()
-    while acttime < 3:
+    while acttime < tout:
         callback(content, key, nonce)
         acttime = time.time() - startt
         count += 1
@@ -97,7 +95,7 @@ def bench(callback, size, tout=3, multi=True):
         time.sleep(3)
         acttime, count = man.close()
     else:
-        acttime, count = _bench(callback, content, key, nonce)
+        acttime, count = _bench(callback, content, key, nonce, tout)
     tput = size * count / (10 ** 6) / acttime
     #print("Function: %s, Multi: %s, Input: %s bytes, throughput: %s Mbs in %ss" % (callback, multi, size, tput, acttime))
     print(";".join([str(callback), str(size), str(tput)]))
@@ -119,83 +117,18 @@ def nacl_aes256gcm(content, key, nonce):
                             nonce=nonce,
                             pack_nonce_aad=False)
 
+def asyncaead_chacha20poly1305_enc(content, key, nonce):
+    return Evp.encrypt(key, content, nonce, b"")
 
-def openssl_poly1305chacha(content, key, nonce):
-    chacha = ChaCha20Poly1305(key)
-    e2 = chacha.encrypt(nonce, content, b'')
-
-def openssl_aes256gcm(content, key, nonce):
-    aes = AESGCM(key)
-    e2 = aes.encrypt(nonce, content, b'')
-
-def openssl_aes128gcm(content, key, nonce):
-    aes = AESGCM(key[:16])
-    e2 = aes.encrypt(nonce, content, b'')
-
-def aeadpy_chacha20poly1305(content, key, nonce):
-    return aeadpy.encrypt(b"CHACHA20_POLY1305", key, content, nonce, b"")["ciphertext"]
-
-def aeadpy_chacha20poly1305_dec(content, key, nonce):
-    return aeadpy.decrypt(b"CHACHA20_POLY1305", key, content, nonce, b"", b"")["plaintext"]
- 
-def openssl_chacha20poly1305custom(content, key, nonce):
-    evp_cipher = backend._lib.EVP_get_cipherbyname(b"chacha20-poly1305")
-    # backend.openssl_assert(evp_cipher != backend._ffi.NULL)
-    ctx = backend._lib.EVP_CIPHER_CTX_new()
-    ctx = backend._ffi.gc(ctx, backend._lib.EVP_CIPHER_CTX_free)
-    backend._lib.EVP_CipherInit_ex(ctx, evp_cipher, backend._ffi.NULL, backend._ffi.NULL, backend._ffi.NULL, 1)
-    # backend.openssl_assert(res != 0)
-    backend._lib.EVP_CIPHER_CTX_set_key_length(ctx, len(key))
-    # backend.openssl_assert(res != 0)
-    backend._lib.EVP_CIPHER_CTX_ctrl(ctx, backend._lib.EVP_CTRL_AEAD_SET_IVLEN, len(nonce), backend._ffi.NULL)
-    # backend.openssl_assert(res != 0)
-   
-    ####
-    
-    nonce_ptr = backend._ffi.from_buffer(nonce)
-    key_ptr = backend._ffi.from_buffer(key)
-    backend._lib.EVP_CipherInit_ex(ctx, backend._ffi.NULL, backend._ffi.NULL, key_ptr, nonce_ptr, 1)
-    # backend.openssl_assert(res != 0)
-    # aad
-    #outlen = backend._ffi.new("int *")
-    #buf = backend._ffi.new("unsigned char[]", 0)
-    #backend._lib.EVP_CipherUpdate(ctx, buf, outlen, b"", 0)
-    # backend.openssl_assert(res != 0)
-    #backend._ffi.buffer(buf, outlen[0])[:]
-
-    # _process_aad(backend, ctx, associated_data)
-    # data
-    outlen = backend._ffi.new("int *")
-    buf = backend._ffi.new("unsigned char[]", len(content))
-    backend._lib.EVP_CipherUpdate(ctx, buf, outlen, content, len(content))
-    # backend.openssl_assert(res != 0)
-    processed_data = backend._ffi.buffer(buf, outlen[0])[:]
-    
-    #processed_data = _process_data(backend, ctx, data)
-    outlen = backend._ffi.new("int *")
-    backend._lib.EVP_CipherFinal_ex(ctx, backend._ffi.NULL, outlen)
-    # backend.openssl_assert(res != 0)
-    # backend.openssl_assert(outlen[0] == 0)
-    tag_buf = backend._ffi.new("unsigned char[]", 16)
-    backend._lib.EVP_CIPHER_CTX_ctrl(ctx, backend._lib.EVP_CTRL_AEAD_GET_TAG, 16, tag_buf)
-    # backend.openssl_assert(res != 0)
-    tag = backend._ffi.buffer(tag_buf)[:]
-
-    return processed_data + tag
 
 print("running on %s core cpu" % cpu_count())
 
 content = os.urandom(256)
 key = os.urandom(32)
 nonce = os.urandom(12)
-enc1 = aeadpy_chacha20poly1305(content, key, nonce)
 enc = nacl_pol1305chacha(content, key, nonce)
-dec = aeadpy_chacha20poly1305_dec(enc, key, nonce)
 
-for i in range(6):
-    print(backend._ffi.string(backend._lib.OpenSSL_version(i)).decode())
-#for cb in openssl_poly1305chacha, nacl_pol1305chacha, openssl_aes128gcm, nacl_aes256gcm, openssl_aes256gcm:
-for cb in [aeadpy_chacha20poly1305, nacl_pol1305chacha]:
-    for multi in (False, ):
+for multi in (False, True):
+    for cb in [asyncaead_chacha20poly1305_enc, nacl_pol1305chacha]:
         for size in sizes:
             ret = bench(cb, size, 3, multi)
